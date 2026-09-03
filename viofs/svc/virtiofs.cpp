@@ -1640,6 +1640,7 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem,
 {
     VIRTFS *VirtFs = (VIRTFS *)FileSystem->UserContext;
     VIRTFS_FILE_CONTEXT *FileContext = (VIRTFS_FILE_CONTEXT *)FileContext0;
+    FUSE_READ_OUT *read_out;
     NTSTATUS Status = STATUS_SUCCESS;
     // Host page size is unknown, but it can't be less than 4KiB
     UINT32 BufSize = min(VirtFs->MaxPages * PAGE_SZ_4K, Length);
@@ -1655,11 +1656,25 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem,
         return STATUS_INVALID_PARAMETER;
     }
 
+    // NOTE (local patch): route reads through the generic IOCTL_VIRTFS_FUSE_REQUEST
+    // bounce path instead of the zero-copy IOCTL_VIRTFS_FUSE_REQUEST_READ. The fast
+    // path has viofs.sys probe-and-lock the caller's user buffer in HandleFuseRead
+    // without an EvtIoInCallerContext callback; under concurrent reads the sequential
+    // queue re-dispatches from the completion DPC (foreign process context), the probe
+    // faults with STATUS_ACCESS_VIOLATION, and the read fails as STATUS_IN_PAGE_ERROR
+    // (Win32 999) without ever reaching the host. The bounce path copies in the caller's
+    // own context and is immune. Reverts svc-side to the pre-#1539 read behavior while
+    // keeping the shipped signed driver.
+    read_out = (FUSE_READ_OUT *)HeapAlloc(GetProcessHeap(), 0, sizeof(*read_out) + BufSize);
+    if (read_out == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     while (Length)
     {
         UINT32 Size = min(Length, BufSize);
         FUSE_READ_IN read_in;
-        fuse_out_for_read read_out_fast;
         UINT32 OutSize;
 
         read_in.read.fh = FileContext->FileHandle;
@@ -1669,41 +1684,37 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem,
         read_in.read.lock_owner = 0;
         read_in.read.flags = 0;
 
-        read_out_fast.hdr.len = Size;
-        read_out_fast.original_pointer = (uint64_t)(ULONG_PTR)Buf;
-
         FUSE_HEADER_INIT(&read_in.hdr, FUSE_READ, FileContext->NodeId, sizeof(read_in.read));
 
-        Status = VirtFsFuseRequest(VirtFs->Device,
-                                   &read_in,
-                                   sizeof(read_in),
-                                   &read_out_fast,
-                                   sizeof(read_out_fast),
-                                   IOCTL_VIRTFS_FUSE_REQUEST_READ);
+        Status = VirtFsFuseRequest(VirtFs->Device, &read_in, sizeof(read_in), read_out, sizeof(*read_out) + Size);
         if (!NT_SUCCESS(Status))
         {
+            SafeHeapFree(read_out);
             return Status;
         }
 
         // Validate device response to prevent buffer overruns
-        if (read_out_fast.hdr.len < sizeof(struct fuse_out_header) ||
-            read_out_fast.hdr.len > sizeof(struct fuse_out_header) + Size)
+        if (read_out->hdr.len < sizeof(struct fuse_out_header) ||
+            read_out->hdr.len > sizeof(struct fuse_out_header) + Size)
         {
             DBG("Device returned invalid header length: %u (valid range: %u-%u)",
-                read_out_fast.hdr.len,
+                read_out->hdr.len,
                 (UINT32)sizeof(struct fuse_out_header),
                 (UINT32)(sizeof(struct fuse_out_header) + Size));
+            SafeHeapFree(read_out);
             return STATUS_IO_DEVICE_ERROR;
         }
 
-        OutSize = read_out_fast.hdr.len - sizeof(struct fuse_out_header);
+        OutSize = read_out->hdr.len - sizeof(struct fuse_out_header);
 
         if (OutSize > Size)
         {
             DBG("Device returned more data than requested: %u (requested: %u)", OutSize, Size);
+            SafeHeapFree(read_out);
             return STATUS_IO_DEVICE_ERROR;
         }
 
+        CopyMemory(Buf, read_out->buf, OutSize);
         *PBytesTransferred += OutSize;
 
         // A successful read with no bytes read means file offset is at or past
@@ -1724,6 +1735,8 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem,
     }
 
     DBG("BytesTransferred: %d", *PBytesTransferred);
+
+    SafeHeapFree(read_out);
 
     return Status;
 }
