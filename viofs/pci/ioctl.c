@@ -420,7 +420,13 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
 {
     NTSTATUS status;
     PVIRTIO_FS_REQUEST fs_req;
-    PVOID in_buf, out_buf;
+    PVOID in_buf;
+    PMDL outputMdl;
+    PMDL firstMdl;
+    PVOID outputMdlVa;
+    PVIRTIO_FS_READ_REQUEST_CONTEXT readContext;
+    ULONG originalBufferLen;
+    ULONG outHeaderLength;
     BOOLEAN hiprio;
 
     if (InputBufferLength < sizeof(struct fuse_in_header))
@@ -437,6 +443,19 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
         goto complete_wdf_req_no_fs_req;
     }
 
+    // The user read buffer was probed and locked in the caller's context by
+    // VirtFsEvtIoInCallerContext. Its absence means the request bypassed that
+    // callback, which should never happen for this IOCTL.
+    readContext = GetReadRequestContext(Request);
+    if (readContext->LockedReadMdl == NULL)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Read buffer was not locked in caller context");
+        status = STATUS_INVALID_DEVICE_STATE;
+        goto complete_wdf_req_no_fs_req;
+    }
+    originalBufferLen = readContext->ReadBufferLength;
+    outHeaderLength = sizeof(struct fuse_out_header);
+
     status = WdfRequestRetrieveInputBuffer(Request, InputBufferLength, &in_buf, NULL);
 
     if (!NT_SUCCESS(status))
@@ -445,11 +464,13 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
         goto complete_wdf_req_no_fs_req;
     }
 
-    status = WdfRequestRetrieveOutputBuffer(Request, OutputBufferLength, &out_buf, NULL);
+    // The direct-I/O output buffer is already locked and described by an MDL; we
+    // carve a device-writable descriptor for the reply header out of it below.
+    status = WdfRequestRetrieveOutputWdmMdl(Request, &outputMdl);
 
     if (!NT_SUCCESS(status))
     {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveOutputBuffer failed");
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveOutputWdmMdl failed");
         goto complete_wdf_req_no_fs_req;
     }
 
@@ -460,42 +481,31 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
         goto complete_wdf_req_no_fs_req;
     }
 
-    PVOID originalBuffer = (PVOID)(ULONG_PTR)((struct fuse_out_for_read *)out_buf)->original_pointer;
-    ULONG originalBufferLen = ((struct fuse_out_for_read *)out_buf)->hdr.len;
-    ULONG outHeaderLength = sizeof(((struct fuse_out_for_read *)out_buf)->hdr);
-
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_IOCTL, "read length %d", originalBufferLen);
 
     fs_req->Request = Request;
     fs_req->Cancellable = FALSE;
 
-    WDFMEMORY userMem;
-    status = WdfRequestProbeAndLockUserBufferForWrite(Request, originalBuffer, originalBufferLen, &userMem);
-    if (!NT_SUCCESS(status))
+    // Reply header (fuse_out_header) lands in the first outHeaderLength bytes of the
+    // output buffer. Build a partial MDL from the already-locked output MDL instead
+    // of abusing MmBuildMdlForNonPagedPool on a direct-I/O system mapping.
+    outputMdlVa = MmGetMdlVirtualAddress(outputMdl);
+    firstMdl = IoAllocateMdl(outputMdlVa, outHeaderLength, FALSE, FALSE, NULL);
+    if (firstMdl == NULL)
     {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestProbeAndLockUserBufferForWrite failed");
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Can't create reply-header MDL");
+        status = STATUS_INSUFFICIENT_RESOURCES;
         goto complete_wdf_req;
     }
+    IoBuildPartialMdl(outputMdl, firstMdl, outputMdlVa, outHeaderLength);
 
-    PMDL firstMdl = IoAllocateMdl(out_buf, outHeaderLength, FALSE, FALSE, NULL);
-    if (!firstMdl)
-    {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Can't create MDL1");
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto complete_wdf_req;
-    }
-    PMDL secondMdl = IoAllocateMdl(WdfMemoryGetBuffer(userMem, NULL), originalBufferLen, FALSE, FALSE, NULL);
-    if (!secondMdl)
-    {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Can't create MDL2");
-        IoFreeMdl(firstMdl);
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto complete_wdf_req;
-    }
-    MmBuildMdlForNonPagedPool(firstMdl);
-    MmBuildMdlForNonPagedPool(secondMdl);
-    firstMdl->Next = secondMdl;
+    // Chain [reply header] -> [locked user read buffer]. Ownership of the locked
+    // MDL now belongs to the fs_req MDL chain (released by FreeVirtFsRequest);
+    // clear it from the request context so the cleanup callback does not free it
+    // a second time.
+    firstMdl->Next = readContext->LockedReadMdl;
     fs_req->Mdl = firstMdl;
+    readContext->LockedReadMdl = NULL;
 
     RtlZeroMemory(&fs_req->H2D_Params, sizeof(fs_req->H2D_Params));
     RtlZeroMemory(&fs_req->D2H_Params, sizeof(fs_req->D2H_Params));
@@ -516,10 +526,14 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
     hiprio = FALSE;
 
     status = VirtFsEnqueueRequest(Context, fs_req, hiprio);
-    if (NT_SUCCESS(status))
+    if (!NT_SUCCESS(status))
     {
-        return;
+        // VirtFsEnqueueRequest already linked fs_req into RequestsList; FailFsRequest
+        // dequeues it, completes the WDF request and frees it (unlocking the read
+        // buffer via FreeVirtFsRequest). Mirrors the generic-request failure path.
+        FailFsRequest(Context, fs_req);
     }
+    return;
 
 complete_wdf_req:
     FreeVirtFsRequest(fs_req);
@@ -527,6 +541,114 @@ complete_wdf_req:
 complete_wdf_req_no_fs_req:
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_IOCTL, "Complete Request: %p Status: %!STATUS!", Request, status);
     WdfRequestComplete(Request, status);
+}
+
+// Runs at PASSIVE_LEVEL in the requestor's thread/process context (before the
+// request is placed in a queue). For IOCTL_VIRTFS_FUSE_REQUEST_READ this is the
+// only place where the smuggled user-mode read buffer VA is valid and where
+// MmProbeAndLockPages may legitimately fault it in. All other requests are
+// forwarded to their queue unchanged.
+VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
+{
+    NTSTATUS status;
+    WDF_REQUEST_PARAMETERS params;
+    PVOID out_buf;
+    PVOID originalBuffer;
+    ULONG originalBufferLen;
+    PMDL readMdl;
+    PVIRTIO_FS_READ_REQUEST_CONTEXT readContext;
+
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(Request, &params);
+
+    if (params.Type != WdfRequestTypeDeviceControl ||
+        params.Parameters.DeviceIoControl.IoControlCode != IOCTL_VIRTFS_FUSE_REQUEST_READ)
+    {
+        status = WdfDeviceEnqueueRequest(Device, Request);
+        if (!NT_SUCCESS(status))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfDeviceEnqueueRequest failed: %!STATUS!", status);
+            WdfRequestComplete(Request, status);
+        }
+        return;
+    }
+
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(struct fuse_out_for_read), &out_buf, NULL);
+    if (!NT_SUCCESS(status))
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveOutputBuffer failed: %!STATUS!", status);
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    originalBuffer = (PVOID)(ULONG_PTR)((struct fuse_out_for_read *)out_buf)->original_pointer;
+    originalBufferLen = ((struct fuse_out_for_read *)out_buf)->hdr.len;
+
+    // Reject a NULL/zero buffer, and a length so large that adding the reply-header
+    // size in HandleFuseRead (outHeaderLength + originalBufferLen) would overflow ULONG
+    // and under-size the DMA transfer. hdr.len is attacker-controllable by a process that
+    // opens the device interface directly; the WinFsp service never reads near this bound.
+    if (originalBuffer == NULL || originalBufferLen == 0 ||
+        originalBufferLen > MAXULONG - sizeof(struct fuse_out_header))
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Invalid zero-copy read buffer");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    readMdl = IoAllocateMdl(originalBuffer, originalBufferLen, FALSE, FALSE, NULL);
+    if (readMdl == NULL)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "IoAllocateMdl for read buffer failed");
+        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+
+    // The host writes file data into this buffer, so lock it for write access.
+    // Use the requestor's access mode so a bad user pointer is rejected as a
+    // per-request failure rather than trusted.
+    __try
+    {
+        MmProbeAndLockPages(readMdl, WdfRequestGetRequestorMode(Request), IoWriteAccess);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = GetExceptionCode();
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "MmProbeAndLockPages failed: %!STATUS!", status);
+        IoFreeMdl(readMdl);
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    readContext = GetReadRequestContext(Request);
+    readContext->LockedReadMdl = readMdl;
+    readContext->ReadBufferLength = originalBufferLen;
+
+    status = WdfDeviceEnqueueRequest(Device, Request);
+    if (!NT_SUCCESS(status))
+    {
+        // The request is completed here; VirtFsReadRequestContextCleanup unlocks and
+        // frees LockedReadMdl when the framework deletes it.
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfDeviceEnqueueRequest failed: %!STATUS!", status);
+        WdfRequestComplete(Request, status);
+    }
+}
+
+// Releases the locked read buffer for any request completed before HandleFuseRead
+// took ownership of the MDL: probe/enqueue failures and, importantly, cancellation
+// or queue purge while the request waited. Runs at IRQL <= DISPATCH_LEVEL, where
+// MmUnlockPages and IoFreeMdl are both legal. Once HandleFuseRead hands the MDL to
+// the fs_req chain it clears LockedReadMdl, so this becomes a no-op.
+VOID VirtFsReadRequestContextCleanup(IN WDFOBJECT Object)
+{
+    PVIRTIO_FS_READ_REQUEST_CONTEXT readContext = GetReadRequestContext(Object);
+
+    if (readContext->LockedReadMdl != NULL)
+    {
+        MmUnlockPages(readContext->LockedReadMdl);
+        IoFreeMdl(readContext->LockedReadMdl);
+        readContext->LockedReadMdl = NULL;
+    }
 }
 
 void CopyBuffer(void *_Dst, void const *_Src, size_t _Size)
