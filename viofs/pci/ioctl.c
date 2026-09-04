@@ -553,8 +553,11 @@ VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
     NTSTATUS status;
     WDF_REQUEST_PARAMETERS params;
     PVOID out_buf;
+    PVOID in_buf;
+    size_t inputBufferLen;
     PVOID originalBuffer;
     ULONG originalBufferLen;
+    SIZE_T combinedSgFragments;
     PMDL readMdl;
     PVIRTIO_FS_READ_REQUEST_CONTEXT readContext;
 
@@ -593,20 +596,35 @@ VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
         return;
     }
 
+    // The input buffer carries the FUSE_READ_IN request and is DMA-mapped as the
+    // device-readable (H2D) part in HandleFuseRead. Retrieve it here so its fragments
+    // can be counted in the bound below before the read buffer is locked.
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(struct fuse_in_header), &in_buf, &inputBufferLen);
+    if (!NT_SUCCESS(status))
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveInputBuffer failed: %!STATUS!", status);
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
     originalBuffer = (PVOID)(ULONG_PTR)((struct fuse_out_for_read *)out_buf)->original_pointer;
     originalBufferLen = ((struct fuse_out_for_read *)out_buf)->hdr.len;
 
-    // hdr.len and original_pointer are attacker-controllable by a process that opens the
-    // device interface directly; the WinFsp service never approaches these bounds. Reject:
-    // a NULL/zero buffer; a length whose reply-header addition in HandleFuseRead
-    // (outHeaderLength + originalBufferLen) would overflow ULONG; and a length whose page
-    // fragments, plus the reserved request and reply-header fragments, would exceed
-    // VIRT_FS_MAX_QUEUE_SIZE, which VirtioFsRxTransactionCallback otherwise rejects only
-    // after the buffer has already been probed and locked.
+    // Page fragments this request would add to the virtqueue: the device-readable input
+    // (FUSE_READ_IN) buffer, the device-writable read buffer, and a reserve for the reply
+    // header and page-straddle rounding. Computed in SIZE_T so the sum cannot overflow.
+    combinedSgFragments = ADDRESS_AND_SIZE_TO_SPAN_PAGES(in_buf, inputBufferLen) +
+                          ADDRESS_AND_SIZE_TO_SPAN_PAGES(originalBuffer, originalBufferLen) + VIRT_FS_READ_SG_RESERVE;
+
+    // hdr.len, original_pointer and the input buffer length are attacker-controllable by a
+    // process that opens the device interface directly; the WinFsp service never approaches
+    // these bounds. Reject: a NULL/zero read buffer; a read length whose reply-header
+    // addition in HandleFuseRead (outHeaderLength + originalBufferLen) would overflow ULONG;
+    // and a request whose combined fragments would exceed VIRT_FS_MAX_QUEUE_SIZE, which
+    // VirtioFsRxTransactionCallback otherwise rejects only after the read buffer has already
+    // been probed and locked.
     if (originalBuffer == NULL || originalBufferLen == 0 ||
-        originalBufferLen > MAXULONG - sizeof(struct fuse_out_header) ||
-        ADDRESS_AND_SIZE_TO_SPAN_PAGES(originalBuffer,
-                                       originalBufferLen) + VIRT_FS_READ_SG_RESERVE > VIRT_FS_MAX_QUEUE_SIZE)
+        originalBufferLen > MAXULONG - sizeof(struct fuse_out_header) || combinedSgFragments > VIRT_FS_MAX_QUEUE_SIZE)
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Invalid zero-copy read buffer");
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);

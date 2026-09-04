@@ -53,8 +53,9 @@
 #define VIRT_FS_INDIRECT_AREA_CAPACITY (VIRT_FS_INDIRECT_AREA_PAGES * VIRT_FS_INDIRECT_PAGE_CAPACITY)
 #define VIRT_FS_MAX_QUEUE_SIZE         1024
 
-// SG fragments to reserve for the FUSE_READ_IN request and the reply header when
-// bounding a zero-copy read length against VIRT_FS_MAX_QUEUE_SIZE.
+// SG fragments to reserve for the reply header and page-straddle rounding when
+// bounding the combined zero-copy read scatter-gather list against
+// VIRT_FS_MAX_QUEUE_SIZE. The input and read buffer fragments are counted separately.
 #define VIRT_FS_READ_SG_RESERVE        8
 
 enum
