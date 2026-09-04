@@ -420,13 +420,11 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
 {
     NTSTATUS status;
     PVIRTIO_FS_REQUEST fs_req;
-    PVOID in_buf;
-    PMDL outputMdl;
-    PMDL firstMdl;
-    PVOID outputMdlVa;
-    PVIRTIO_FS_READ_REQUEST_CONTEXT readContext;
-    ULONG originalBufferLen;
-    ULONG outHeaderLength;
+    PVOID in_buf, out_buf;
+    PMDL outputMdl, firstMdl, readMdl;
+    PVOID outputMdlVa, originalBuffer;
+    ULONG originalBufferLen, outHeaderLength;
+    SIZE_T combinedSgFragments;
     BOOLEAN hiprio;
 
     if (InputBufferLength < sizeof(struct fuse_in_header))
@@ -443,31 +441,44 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
         goto complete_wdf_req_no_fs_req;
     }
 
-    // The user read buffer was probed and locked in the caller's context by
-    // VirtFsEvtIoInCallerContext. Its absence means the request bypassed that
-    // callback, which should never happen for this IOCTL.
-    readContext = GetReadRequestContext(Request);
-    if (readContext->LockedReadMdl == NULL)
-    {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Read buffer was not locked in caller context");
-        status = STATUS_INVALID_DEVICE_STATE;
-        goto complete_wdf_req_no_fs_req;
-    }
-    originalBufferLen = readContext->ReadBufferLength;
-    outHeaderLength = sizeof(struct fuse_out_header);
-
     status = WdfRequestRetrieveInputBuffer(Request, InputBufferLength, &in_buf, NULL);
-
     if (!NT_SUCCESS(status))
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveInputBuffer failed");
         goto complete_wdf_req_no_fs_req;
     }
 
-    // The direct-I/O output buffer is already locked and described by an MDL; we
-    // carve a device-writable descriptor for the reply header out of it below.
-    status = WdfRequestRetrieveOutputWdmMdl(Request, &outputMdl);
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(struct fuse_out_for_read), &out_buf, NULL);
+    if (!NT_SUCCESS(status))
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveOutputBuffer failed");
+        goto complete_wdf_req_no_fs_req;
+    }
 
+    originalBuffer = (PVOID)(ULONG_PTR)((struct fuse_out_for_read *)out_buf)->original_pointer;
+    originalBufferLen = ((struct fuse_out_for_read *)out_buf)->hdr.len;
+    outHeaderLength = sizeof(struct fuse_out_header);
+
+    // hdr.len, original_pointer and the input buffer length are attacker-controllable by a
+    // process that opens the device interface directly; the WinFsp service never approaches
+    // these bounds. Reject: a NULL/zero read buffer; a read length whose reply-header
+    // addition below (outHeaderLength + originalBufferLen) would overflow ULONG; and a
+    // request whose combined device-readable (input) and device-writable (reply header plus
+    // read buffer) page fragments would exceed VIRT_FS_MAX_QUEUE_SIZE, which
+    // VirtioFsRxTransactionCallback otherwise rejects only after the read buffer is locked.
+    combinedSgFragments = ADDRESS_AND_SIZE_TO_SPAN_PAGES(in_buf, InputBufferLength) +
+                          ADDRESS_AND_SIZE_TO_SPAN_PAGES(originalBuffer, originalBufferLen) + VIRT_FS_READ_SG_RESERVE;
+    if (originalBuffer == NULL || originalBufferLen == 0 ||
+        originalBufferLen > MAXULONG - sizeof(struct fuse_out_header) || combinedSgFragments > VIRT_FS_MAX_QUEUE_SIZE)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Invalid zero-copy read buffer");
+        status = STATUS_INVALID_PARAMETER;
+        goto complete_wdf_req_no_fs_req;
+    }
+
+    // The direct-I/O output buffer is already locked and described by an MDL; we carve a
+    // device-writable descriptor for the reply header out of it below.
+    status = WdfRequestRetrieveOutputWdmMdl(Request, &outputMdl);
     if (!NT_SUCCESS(status))
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveOutputWdmMdl failed");
@@ -475,7 +486,6 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
     }
 
     status = AllocateVirtFSRequest(Context, &fs_req, in_buf);
-
     if (!NT_SUCCESS(status))
     {
         goto complete_wdf_req_no_fs_req;
@@ -499,13 +509,36 @@ static VOID HandleFuseRead(IN PDEVICE_CONTEXT Context,
     }
     IoBuildPartialMdl(outputMdl, firstMdl, outputMdlVa, outHeaderLength);
 
-    // Chain [reply header] -> [locked user read buffer]. Ownership of the locked
-    // MDL now belongs to the fs_req MDL chain (released by FreeVirtFsRequest);
-    // clear it from the request context so the cleanup callback does not free it
-    // a second time.
-    firstMdl->Next = readContext->LockedReadMdl;
+    // Probe and lock the smuggled user read buffer. HandleFuseRead runs at PASSIVE_LEVEL
+    // in the requestor's thread/process context (from VirtFsEvtIoInCallerContext), the only
+    // context where that user VA is valid, so the probe cannot fault the way it did when the
+    // read was dispatched from the sequential queue's arbitrary DPC context.
+    readMdl = IoAllocateMdl(originalBuffer, originalBufferLen, FALSE, FALSE, NULL);
+    if (readMdl == NULL)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Can't create read-buffer MDL");
+        IoFreeMdl(firstMdl);
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto complete_wdf_req;
+    }
+
+    __try
+    {
+        MmProbeAndLockPages(readMdl, WdfRequestGetRequestorMode(Request), IoWriteAccess);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = GetExceptionCode();
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "MmProbeAndLockPages failed: %!STATUS!", status);
+        IoFreeMdl(readMdl);
+        IoFreeMdl(firstMdl);
+        goto complete_wdf_req;
+    }
+
+    // Chain [reply header] -> [locked user read buffer]; the whole chain is owned by
+    // fs_req and released by FreeVirtFsRequest, which unlocks any MDL_PAGES_LOCKED node.
+    firstMdl->Next = readMdl;
     fs_req->Mdl = firstMdl;
-    readContext->LockedReadMdl = NULL;
 
     RtlZeroMemory(&fs_req->H2D_Params, sizeof(fs_req->H2D_Params));
     RtlZeroMemory(&fs_req->D2H_Params, sizeof(fs_req->D2H_Params));
@@ -543,23 +576,16 @@ complete_wdf_req_no_fs_req:
     WdfRequestComplete(Request, status);
 }
 
-// Runs at PASSIVE_LEVEL in the requestor's thread/process context (before the
-// request is placed in a queue). For IOCTL_VIRTFS_FUSE_REQUEST_READ this is the
-// only place where the smuggled user-mode read buffer VA is valid and where
-// MmProbeAndLockPages may legitimately fault it in. All other requests are
-// forwarded to their queue unchanged.
+// Runs at PASSIVE_LEVEL in the requestor's thread/process context, before the request
+// is placed in a queue. IOCTL_VIRTFS_FUSE_REQUEST_READ carries a raw user-mode buffer
+// VA that is only valid in this context, so the whole read is submitted here through
+// HandleFuseRead; its buffer is probed and locked at PASSIVE_LEVEL in the requestor's
+// context instead of on the sequential queue's arbitrary DPC dispatch. All other
+// requests are forwarded to the queue unchanged.
 VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
 {
     NTSTATUS status;
     WDF_REQUEST_PARAMETERS params;
-    PVOID out_buf;
-    PVOID in_buf;
-    size_t inputBufferLen;
-    PVOID originalBuffer;
-    ULONG originalBufferLen;
-    SIZE_T combinedSgFragments;
-    PMDL readMdl;
-    PVIRTIO_FS_READ_REQUEST_CONTEXT readContext;
 
     WDF_REQUEST_PARAMETERS_INIT(&params);
     WdfRequestGetParameters(Request, &params);
@@ -576,11 +602,10 @@ VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
         return;
     }
 
-    // The zero-copy read path probe-and-locks a user virtual address below. It is only
-    // meaningful for the user-mode file system service, and MmProbeAndLockPages requires
-    // IRQL <= APC_LEVEL for a pageable address. This callback runs at the requestor's
-    // IRQL, so a kernel-mode sender at DISPATCH_LEVEL would reach the probe at an illegal
-    // IRQL, which the __except below cannot recover. Reject such a requestor up front.
+    // HandleFuseRead probe-and-locks a user virtual address, which MmProbeAndLockPages may
+    // only do at IRQL <= APC_LEVEL for a user-mode requestor. This callback runs at the
+    // requestor's IRQL, so reject a kernel-mode sender or one above APC_LEVEL rather than
+    // fault in the probe.
     if (WdfRequestGetRequestorMode(Request) != UserMode || KeGetCurrentIrql() > APC_LEVEL)
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Zero-copy read from unsupported context");
@@ -588,102 +613,13 @@ VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
         return;
     }
 
-    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(struct fuse_out_for_read), &out_buf, NULL);
-    if (!NT_SUCCESS(status))
-    {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveOutputBuffer failed: %!STATUS!", status);
-        WdfRequestComplete(Request, status);
-        return;
-    }
-
-    // The input buffer carries the FUSE_READ_IN request and is DMA-mapped as the
-    // device-readable (H2D) part in HandleFuseRead. Retrieve it here so its fragments
-    // can be counted in the bound below before the read buffer is locked.
-    status = WdfRequestRetrieveInputBuffer(Request, sizeof(struct fuse_in_header), &in_buf, &inputBufferLen);
-    if (!NT_SUCCESS(status))
-    {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfRequestRetrieveInputBuffer failed: %!STATUS!", status);
-        WdfRequestComplete(Request, status);
-        return;
-    }
-
-    originalBuffer = (PVOID)(ULONG_PTR)((struct fuse_out_for_read *)out_buf)->original_pointer;
-    originalBufferLen = ((struct fuse_out_for_read *)out_buf)->hdr.len;
-
-    // Page fragments this request would add to the virtqueue: the device-readable input
-    // (FUSE_READ_IN) buffer, the device-writable read buffer, and a reserve for the reply
-    // header and page-straddle rounding. Computed in SIZE_T so the sum cannot overflow.
-    combinedSgFragments = ADDRESS_AND_SIZE_TO_SPAN_PAGES(in_buf, inputBufferLen) +
-                          ADDRESS_AND_SIZE_TO_SPAN_PAGES(originalBuffer, originalBufferLen) + VIRT_FS_READ_SG_RESERVE;
-
-    // hdr.len, original_pointer and the input buffer length are attacker-controllable by a
-    // process that opens the device interface directly; the WinFsp service never approaches
-    // these bounds. Reject: a NULL/zero read buffer; a read length whose reply-header
-    // addition in HandleFuseRead (outHeaderLength + originalBufferLen) would overflow ULONG;
-    // and a request whose combined fragments would exceed VIRT_FS_MAX_QUEUE_SIZE, which
-    // VirtioFsRxTransactionCallback otherwise rejects only after the read buffer has already
-    // been probed and locked.
-    if (originalBuffer == NULL || originalBufferLen == 0 ||
-        originalBufferLen > MAXULONG - sizeof(struct fuse_out_header) || combinedSgFragments > VIRT_FS_MAX_QUEUE_SIZE)
-    {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Invalid zero-copy read buffer");
-        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
-        return;
-    }
-
-    readMdl = IoAllocateMdl(originalBuffer, originalBufferLen, FALSE, FALSE, NULL);
-    if (readMdl == NULL)
-    {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "IoAllocateMdl for read buffer failed");
-        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
-        return;
-    }
-
-    // The host writes file data into this buffer, so lock it for write access.
-    // Use the requestor's access mode so a bad user pointer is rejected as a
-    // per-request failure rather than trusted.
-    __try
-    {
-        MmProbeAndLockPages(readMdl, WdfRequestGetRequestorMode(Request), IoWriteAccess);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        status = GetExceptionCode();
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "MmProbeAndLockPages failed: %!STATUS!", status);
-        IoFreeMdl(readMdl);
-        WdfRequestComplete(Request, status);
-        return;
-    }
-
-    readContext = GetReadRequestContext(Request);
-    readContext->LockedReadMdl = readMdl;
-    readContext->ReadBufferLength = originalBufferLen;
-
-    status = WdfDeviceEnqueueRequest(Device, Request);
-    if (!NT_SUCCESS(status))
-    {
-        // The request is completed here; VirtFsReadRequestContextCleanup unlocks and
-        // frees LockedReadMdl when the framework deletes it.
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "WdfDeviceEnqueueRequest failed: %!STATUS!", status);
-        WdfRequestComplete(Request, status);
-    }
-}
-
-// Releases the locked read buffer for any request completed before HandleFuseRead
-// took ownership of the MDL: probe/enqueue failures and, importantly, cancellation
-// or queue purge while the request waited. Runs at IRQL <= DISPATCH_LEVEL, where
-// MmUnlockPages and IoFreeMdl are both legal. Once HandleFuseRead hands the MDL to
-// the fs_req chain it clears LockedReadMdl, so this becomes a no-op.
-VOID VirtFsReadRequestContextCleanup(IN WDFOBJECT Object)
-{
-    PVIRTIO_FS_READ_REQUEST_CONTEXT readContext = GetReadRequestContext(Object);
-
-    if (readContext->LockedReadMdl != NULL)
-    {
-        MmUnlockPages(readContext->LockedReadMdl);
-        IoFreeMdl(readContext->LockedReadMdl);
-        readContext->LockedReadMdl = NULL;
-    }
+    // Submit the read entirely in this context. HandleFuseRead either pends it on the
+    // virtqueue (completed later by the DMA completion path) or completes it on error;
+    // either way the request is not returned to the queue.
+    HandleFuseRead(GetDeviceContext(Device),
+                   Request,
+                   params.Parameters.DeviceIoControl.OutputBufferLength,
+                   params.Parameters.DeviceIoControl.InputBufferLength);
 }
 
 void CopyBuffer(void *_Dst, void const *_Src, size_t _Size)
@@ -850,11 +786,8 @@ VOID VirtFsEvtIoDeviceControl(IN WDFQUEUE Queue,
             HandleSubmitFuseRequest(context, Request, OutputBufferLength, InputBufferLength);
             break;
 
-        case IOCTL_VIRTFS_FUSE_REQUEST_READ:
-            // OutputBuffer - fuse_out_for_read
-            // InputBuffer  - usual
-            HandleFuseRead(context, Request, OutputBufferLength, InputBufferLength);
-            break;
+            // IOCTL_VIRTFS_FUSE_REQUEST_READ is handled entirely in VirtFsEvtIoInCallerContext
+            // and is never delivered to this queue.
 
         default:
             WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);

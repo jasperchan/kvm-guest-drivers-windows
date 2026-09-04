@@ -75,7 +75,6 @@ NTSTATUS VirtFsEvtDeviceAdd(IN WDFDRIVER Driver, IN PWDFDEVICE_INIT DeviceInit)
     WDFDEVICE device;
     WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks;
     WDF_OBJECT_ATTRIBUTES attributes;
-    WDF_OBJECT_ATTRIBUTES requestAttributes;
     WDFQUEUE queue;
     WDF_IO_QUEUE_CONFIG queueConfig;
     WDF_INTERRUPT_CONFIG interruptConfig;
@@ -99,17 +98,9 @@ NTSTATUS VirtFsEvtDeviceAdd(IN WDFDRIVER Driver, IN PWDFDEVICE_INIT DeviceInit)
 
     // The zero-copy read IOCTL carries a raw user-mode buffer pointer that must be
     // probed and locked in the requestor's thread/process context. Register an
-    // in-caller-context callback so that work runs at PASSIVE_LEVEL in that context
-    // instead of on the sequential queue's (arbitrary, DPC) dispatch context.
+    // in-caller-context callback so the whole read submission runs at PASSIVE_LEVEL
+    // in that context instead of on the sequential queue's (arbitrary, DPC) dispatch.
     WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, VirtFsEvtIoInCallerContext);
-
-    // Give every request a context that can carry the locked read-buffer MDL from
-    // the caller-context callback to HandleFuseRead, with a cleanup callback that
-    // releases it if the request is completed (cancelled/purged/failed) before
-    // HandleFuseRead takes ownership.
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&requestAttributes, VIRTIO_FS_READ_REQUEST_CONTEXT);
-    requestAttributes.EvtCleanupCallback = VirtFsReadRequestContextCleanup;
-    WdfDeviceInitSetRequestAttributes(DeviceInit, &requestAttributes);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
     attributes.EvtCleanupCallback = VirtFsEvtDeviceContextCleanup;

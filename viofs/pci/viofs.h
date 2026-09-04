@@ -102,22 +102,6 @@ typedef struct _VIRTIO_FS_REQUEST
 #endif
 } VIRTIO_FS_REQUEST, *PVIRTIO_FS_REQUEST;
 
-// Per-WDFREQUEST context for the zero-copy read path
-// (IOCTL_VIRTFS_FUSE_REQUEST_READ). The user-mode read buffer smuggled in
-// fuse_out_for_read.original_pointer is probed and locked in the requestor's
-// process context by VirtFsEvtIoInCallerContext, and described by LockedReadMdl.
-// HandleFuseRead takes ownership of the MDL (moving it into the VIRTIO_FS_REQUEST
-// MDL chain and clearing LockedReadMdl); until that hand-off - and on the probe,
-// cancellation and queue-purge paths - the MDL is unlocked and freed by
-// VirtFsReadRequestContextCleanup when the framework deletes the request.
-typedef struct _VIRTIO_FS_READ_REQUEST_CONTEXT
-{
-    PMDL LockedReadMdl;
-    ULONG ReadBufferLength;
-} VIRTIO_FS_READ_REQUEST_CONTEXT, *PVIRTIO_FS_READ_REQUEST_CONTEXT;
-
-WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(VIRTIO_FS_READ_REQUEST_CONTEXT, GetReadRequestContext);
-
 typedef struct _DEVICE_CONTEXT
 {
 
@@ -172,7 +156,6 @@ EVT_WDF_INTERRUPT_DISABLE VirtFsEvtInterruptDisable;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL VirtFsEvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_STOP VirtFsEvtIoStop;
 EVT_WDF_IO_IN_CALLER_CONTEXT VirtFsEvtIoInCallerContext;
-EVT_WDF_OBJECT_CONTEXT_CLEANUP VirtFsReadRequestContextCleanup;
 
 BOOLEAN VirtFsDequeueRequest(PDEVICE_CONTEXT Context, PVIRTIO_FS_REQUEST Req);
 BOOLEAN VirtFsDequeueWdfRequest(PDEVICE_CONTEXT Context, WDFREQUEST WdfRequest);
