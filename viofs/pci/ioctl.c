@@ -573,6 +573,18 @@ VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
         return;
     }
 
+    // The zero-copy read path probe-and-locks a user virtual address below. It is only
+    // meaningful for the user-mode file system service, and MmProbeAndLockPages requires
+    // IRQL <= APC_LEVEL for a pageable address. This callback runs at the requestor's
+    // IRQL, so a kernel-mode sender at DISPATCH_LEVEL would reach the probe at an illegal
+    // IRQL, which the __except below cannot recover. Reject such a requestor up front.
+    if (WdfRequestGetRequestorMode(Request) != UserMode || KeGetCurrentIrql() > APC_LEVEL)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Zero-copy read from unsupported context");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
+        return;
+    }
+
     status = WdfRequestRetrieveOutputBuffer(Request, sizeof(struct fuse_out_for_read), &out_buf, NULL);
     if (!NT_SUCCESS(status))
     {
@@ -584,12 +596,17 @@ VOID VirtFsEvtIoInCallerContext(IN WDFDEVICE Device, IN WDFREQUEST Request)
     originalBuffer = (PVOID)(ULONG_PTR)((struct fuse_out_for_read *)out_buf)->original_pointer;
     originalBufferLen = ((struct fuse_out_for_read *)out_buf)->hdr.len;
 
-    // Reject a NULL/zero buffer, and a length so large that adding the reply-header
-    // size in HandleFuseRead (outHeaderLength + originalBufferLen) would overflow ULONG
-    // and under-size the DMA transfer. hdr.len is attacker-controllable by a process that
-    // opens the device interface directly; the WinFsp service never reads near this bound.
+    // hdr.len and original_pointer are attacker-controllable by a process that opens the
+    // device interface directly; the WinFsp service never approaches these bounds. Reject:
+    // a NULL/zero buffer; a length whose reply-header addition in HandleFuseRead
+    // (outHeaderLength + originalBufferLen) would overflow ULONG; and a length whose page
+    // fragments, plus the reserved request and reply-header fragments, would exceed
+    // VIRT_FS_MAX_QUEUE_SIZE, which VirtioFsRxTransactionCallback otherwise rejects only
+    // after the buffer has already been probed and locked.
     if (originalBuffer == NULL || originalBufferLen == 0 ||
-        originalBufferLen > MAXULONG - sizeof(struct fuse_out_header))
+        originalBufferLen > MAXULONG - sizeof(struct fuse_out_header) ||
+        ADDRESS_AND_SIZE_TO_SPAN_PAGES(originalBuffer,
+                                       originalBufferLen) + VIRT_FS_READ_SG_RESERVE > VIRT_FS_MAX_QUEUE_SIZE)
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Invalid zero-copy read buffer");
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);

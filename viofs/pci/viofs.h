@@ -53,6 +53,10 @@
 #define VIRT_FS_INDIRECT_AREA_CAPACITY (VIRT_FS_INDIRECT_AREA_PAGES * VIRT_FS_INDIRECT_PAGE_CAPACITY)
 #define VIRT_FS_MAX_QUEUE_SIZE         1024
 
+// SG fragments to reserve for the FUSE_READ_IN request and the reply header when
+// bounding a zero-copy read length against VIRT_FS_MAX_QUEUE_SIZE.
+#define VIRT_FS_READ_SG_RESERVE        8
+
 enum
 {
     VQ_TYPE_HIPRIO = 0,
